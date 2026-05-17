@@ -240,7 +240,7 @@ class DataFeed:
         resp  = self._client.get_ticker("BTCUSD")
         log.debug("[DataFeed] get_ticker('BTCUSD') raw: %s", resp)
         price = float(resp["mark_price"])
-        log.info("[DataFeed] BTC Spot (mark_price): $%,.2f", price)
+        log.info("[DataFeed] BTC Spot (mark_price): $%s", f"{price:,.2f}")
         return price
 
     # ── Expiry ─────────────────────────────────────────────────────────────
@@ -396,36 +396,38 @@ class DataFeed:
 
     # ── Live positions ─────────────────────────────────────────────────────
 
-    def get_live_positions(self) -> dict[str, float]:
+    def get_position_size(self, product_id: int, symbol: str) -> float:
         """
-        Fetch all open positions from the exchange and return a dict of
-        {symbol: net_size}.  A symbol absent from the dict (or with
-        net_size == 0) means the position has been closed on the exchange.
+        Fetch the live net position size for a single product.
+        Returns the size (negative = short) or 0.0 if no position exists
+        or the call fails.
 
-        Delta Exchange returns a list under result[].  Each entry has:
-          "symbol"   : product symbol string
-          "size"     : total open size (signed — negative = short)
+        Delta Exchange /v2/positions requires either product_id or
+        underlying_asset_symbol as a query parameter — it does not accept
+        a bare call with no filter.
         """
-        log.debug("[DataFeed] get_live_positions → GET /v2/positions")
+        log.debug("[DataFeed] get_position_size(%s, product_id=%d)", symbol, product_id)
         try:
-            raw  = self._client.request(method="GET", path="/v2/positions",
-                                        auth=True)
-            data = _safe_request_json(raw, "get_live_positions")
-            rows = data.get("result", [])
-            positions: dict[str, float] = {}
-            for row in rows:
-                sym  = row.get("symbol", "")
-                size = float(row.get("size", 0) or 0)
-                if sym and size != 0:
-                    positions[sym] = size
-            log.debug("[DataFeed] Live positions: %s", positions)
-            return positions
+            raw  = self._client.request(
+                method="GET",
+                path="/v2/positions",
+                query={"product_id": product_id},
+                auth=True,
+            )
+            data = _safe_request_json(raw, f"get_position_size({symbol})")
+            # API returns a single position object (not a list) when queried
+            # by product_id.  Guard for both shapes just in case.
+            result = data.get("result", {})
+            if isinstance(result, list):
+                result = result[0] if result else {}
+            size = float(result.get("size", 0) or 0)
+            log.debug("[DataFeed] position_size(%s) = %.0f", symbol, size)
+            return size
         except Exception as exc:
-            log.error("[DataFeed] get_live_positions failed: %s",
-                      exc, exc_info=True)
-            # Return empty dict — caller treats unknown positions as still open
-            # rather than incorrectly force-closing them.
-            return {}
+            log.error("[DataFeed] get_position_size(%s) failed: %s",
+                      symbol, exc, exc_info=True)
+            return None   # None signals "API error" — distinct from 0 (flat)
+
 
 
 # ─────────────────────────────────────────────
@@ -667,41 +669,37 @@ class PositionManager:
         """
         Compare the bot's local state against live exchange positions.
 
-        For each leg that the bot believes is still open, check whether the
-        exchange still shows a non-zero position for that symbol.  If the
-        exchange position is gone (manually closed, liquidated, expired, etc.)
-        mark the leg as exited so the bot stops treating it as open.
+        Queries each open leg individually by product_id (the Delta Exchange
+        /v2/positions endpoint requires product_id or underlying_asset_symbol).
 
-        Returns True if any leg was reconciled (i.e. state was corrected).
+        Returns True if any leg was reconciled (state was corrected).
 
-        Why this is safe:
-          - We only ever *clear* a leg that the exchange confirms is flat.
-          - On API failure get_live_positions() returns {} — we do nothing
-            rather than incorrectly marking legs as closed.
+        Safety rules:
+          - None return from get_position_size() = API error → skip that leg,
+            don't falsely mark it as closed.
+          - size == 0 confirmed by the exchange → leg was manually closed or
+            liquidated → mark exited and record current mark price.
         """
-        live = self._data.get_live_positions()
-        if not live and live is not None:
-            # Empty dict could mean API failure OR genuinely no positions.
-            # We can't distinguish, so log a warning and skip reconciliation
-            # to avoid falsely marking legs as closed.
-            log.warning("[PositionMgr] reconcile: live positions returned empty — "
-                        "skipping reconciliation to avoid false close")
-            return False
-
         reconciled = False
         for leg in trade.legs:
             if leg.exited:
                 continue
 
-            exchange_size = live.get(leg.symbol, 0.0)
-            if exchange_size == 0.0:
+            size = self._data.get_position_size(leg.product_id, leg.symbol)
+
+            if size is None:
+                # API call failed — be conservative, leave state unchanged.
+                log.warning("[PositionMgr] reconcile: API error for %s — "
+                            "skipping this leg to avoid false close", leg.symbol)
+                continue
+
+            if size == 0.0:
                 log.warning(
                     "[PositionMgr] ⚠️  RECONCILE — %s shows NO open position "
-                    "on exchange (manual close / liquidation detected).  "
+                    "on exchange (manual close / liquidation detected). "
                     "Marking leg as exited in bot state.",
                     leg.symbol,
                 )
-                # Capture current mark price as the best available exit price
                 exit_ltp = self._data.get_mark_price(leg.symbol)
                 if exit_ltp > 0:
                     leg.ltp = exit_ltp
@@ -709,11 +707,11 @@ class PositionManager:
                 reconciled = True
             else:
                 log.debug("[PositionMgr] reconcile: %s exchange_size=%.0f — still open",
-                          leg.symbol, exchange_size)
+                          leg.symbol, size)
 
         if reconciled:
             log.warning("[PositionMgr] ⚠️  State reconciled — one or more legs were "
-                        "manually closed outside the bot.  Exiting trade record.")
+                        "manually closed outside the bot. Exiting trade record.")
             self.exit_trade(trade, "MANUAL_CLOSE_DETECTED")
 
         return reconciled
@@ -992,12 +990,12 @@ class Analytics:
         log.info("  Winners       : %d", len(winners))
         log.info("  Losers        : %d", len(losers))
         log.info("  Win Rate      : %.1f%%", win_rate)
-        log.info("  Mark P&L      : $%+,.4f", total)
-        log.info("  Realised P&L  : $%+,.4f%s",
-                 self._state.realised_pnl,
+        log.info("  Mark P&L      : $%s", f"{total:+,.4f}")
+        log.info("  Realised P&L  : $%s%s",
+                 f"{self._state.realised_pnl:+,.4f}",
                  "  ← fill-based" if self._state.realised_pnl != 0 else
                  "  (no fills recorded)")
-        log.info("  Avg P&L/trade : $%+,.4f", avg_pnl)
+        log.info("  Avg P&L/trade : $%s", f"{avg_pnl:+,.4f}")
         log.info("-" * 60)
         for t in trades:
             sign = "✅" if t.pnl > 0 else "❌"
@@ -1236,8 +1234,8 @@ class ShortStraddleBot:
                 spot       = self._data.get_btc_spot()
                 atm_strike = self._feature.atm_strike(spot)
                 expiry_str = self._data.get_today_expiry_str()
-                log.info("[Bot] spot=$%,.2f  atm_strike=%d  expiry=%s",
-                         spot, atm_strike, expiry_str)
+                log.info("[Bot] spot=$%s  atm_strike=%d  expiry=%s",
+                         f"{spot:,.2f}", atm_strike, expiry_str)
                 chain = self._data.get_option_chain(expiry_str)
             except Exception as exc:
                 log.error("[Bot] Market data error: %s — retrying in 30s",
