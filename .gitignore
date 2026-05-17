@@ -8,5 +8,5 @@ wheels/
 
 # Virtual environments
 .venv
-straddle_bot_delta.log
+.log
 
