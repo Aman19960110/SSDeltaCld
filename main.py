@@ -35,8 +35,8 @@ class BotConfig:
     # base_url = "https://api.delta.exchange"                  # Global production
     # base_url = "https://testnet-api.delta.exchange"          # Global testnet
 
-    quantity           : int            = 50
-    sl_pct             : float          = 0.03
+    quantity           : int            = 10
+    sl_pct             : float          = 0.02
     ema_period         : int            = 5
     slope_thresh       : float          = 10.0
     max_reentry        : int            = 10
@@ -51,6 +51,19 @@ class BotConfig:
 
     candle_poll_interval: int = 60   # seconds between signal checks
     sl_monitor_interval : int = 15   # seconds between SL polls
+
+    # ── Risk management ────────────────────────────────────────────────────
+    # Max mark-price loss allowed for the day (negative = loss).
+    # Bot halts once day_pnl falls below this threshold.
+    daily_loss_limit   : float = -500.0
+
+    # Cooldown after a leg is manually closed externally, in seconds.
+    # Prevents the bot from immediately re-entering after a manual close.
+    manual_close_cooldown: int = 5 * 60   # 5 minutes
+
+    # How many consecutive MANUAL_CLOSE_DETECTED exits before the bot
+    # pauses and waits for manual_close_cooldown before trying again.
+    max_consecutive_manual_closes: int = 3
 
 
 # ─────────────────────────────────────────────
@@ -173,6 +186,15 @@ class BotState:
     day_pnl        : float            = 0.0   # mark-price PnL
     realised_pnl   : float            = 0.0   # fill-based PnL
     running        : bool             = True
+
+    # ── Risk tracking ──────────────────────────────────────────────────────
+    # Timestamp of the most recent MANUAL_CLOSE_DETECTED event.
+    last_manual_close_time : Optional[datetime] = None
+    # Running count of consecutive manual-close exits (resets on SL_HIT or
+    # a clean trade close, so persistent manual interference is caught).
+    consecutive_manual_closes: int = 0
+    # Set True when daily_loss_limit is breached; prevents further entries.
+    daily_loss_halt: bool = False
 
 
 # ─────────────────────────────────────────────
@@ -540,10 +562,19 @@ class StrategyEngine:
         return False, ema, slope
 
     def can_reenter(self) -> bool:
+        # ── Gate 1: daily loss halt ────────────────────────────────────────
+        if self._state.daily_loss_halt:
+            log.warning("[Strategy] 🚨 Daily loss limit hit — "
+                        "no further entries this session")
+            return False
+
+        # ── Gate 2: max re-entry count ─────────────────────────────────────
         if self._state.trade_count >= self._cfg.max_reentry:
             log.info("[Strategy] Max re-entries reached (%d/%d)",
                      self._state.trade_count, self._cfg.max_reentry)
             return False
+
+        # ── Gate 3: cooldown after any exit (SL_HIT or MANUAL_CLOSE) ──────
         if self._state.last_sl_time:
             elapsed   = (_utcnow() - self._state.last_sl_time).total_seconds()
             remaining = self._cfg.reentry_wait - elapsed
@@ -552,6 +583,32 @@ class StrategyEngine:
                          int(remaining), int(elapsed), self._cfg.reentry_wait)
                 return False
             log.debug("[Strategy] Cooldown expired (elapsed=%ds)", int(elapsed))
+
+        # ── Gate 4: extra cooldown after manual close ──────────────────────
+        if self._state.last_manual_close_time:
+            elapsed   = (_utcnow() - self._state.last_manual_close_time).total_seconds()
+            remaining = self._cfg.manual_close_cooldown - elapsed
+            if remaining > 0:
+                log.info("[Strategy] Manual-close cooldown: %ds left  "
+                         "(elapsed=%ds / wait=%ds)",
+                         int(remaining), int(elapsed),
+                         self._cfg.manual_close_cooldown)
+                return False
+
+        # ── Gate 5: too many consecutive manual closes ─────────────────────
+        if (self._state.consecutive_manual_closes
+                >= self._cfg.max_consecutive_manual_closes):
+            log.warning(
+                "[Strategy] ⚠️  %d consecutive manual closes detected — "
+                "pausing until cooldown expires. "
+                "Check exchange manually before resuming.",
+                self._state.consecutive_manual_closes,
+            )
+            # Reset the counter after warning so it doesn't block forever;
+            # the manual_close_cooldown (Gate 4) provides the actual pause.
+            self._state.consecutive_manual_closes = 0
+            return False
+
         return True
 
     def past_session_end(self) -> bool:
@@ -810,6 +867,28 @@ class PositionManager:
         self._state.day_pnl    += trade.pnl
         self._state.active_trade = None
 
+        # ── Risk: manual-close counter ─────────────────────────────────────
+        if reason == "MANUAL_CLOSE_DETECTED":
+            self._state.consecutive_manual_closes += 1
+            self._state.last_manual_close_time = _utcnow()
+            log.warning("[PositionMgr] ⚠️  Manual-close counter: %d/%d",
+                        self._state.consecutive_manual_closes,
+                        self._cfg.max_consecutive_manual_closes)
+        else:
+            # Any non-manual exit resets the consecutive counter
+            self._state.consecutive_manual_closes = 0
+
+        # ── Risk: daily loss halt ──────────────────────────────────────────
+        if (not self._state.daily_loss_halt
+                and self._state.day_pnl <= self._cfg.daily_loss_limit):
+            self._state.daily_loss_halt = True
+            log.error(
+                "[PositionMgr] 🚨 DAILY LOSS LIMIT HIT — "
+                "day_pnl=$%.2f ≤ limit=$%.2f. "
+                "No further entries this session.",
+                self._state.day_pnl, self._cfg.daily_loss_limit,
+            )
+
         # Realised PnL: only when all four fill prices are captured
         c_e, c_x = trade.call_leg.actual_entry, trade.call_leg.actual_exit
         p_e, p_x = trade.put_leg.actual_entry,  trade.put_leg.actual_exit
@@ -996,6 +1075,9 @@ class Analytics:
                  "  ← fill-based" if self._state.realised_pnl != 0 else
                  "  (no fills recorded)")
         log.info("  Avg P&L/trade : $%s", f"{avg_pnl:+,.4f}")
+        if self._state.daily_loss_halt:
+            log.warning("  ⚠️  Session halted by DAILY LOSS LIMIT  "
+                        "(limit=$%.2f)", self._cfg.daily_loss_limit)
         log.info("-" * 60)
         for t in trades:
             sign = "✅" if t.pnl > 0 else "❌"
@@ -1054,6 +1136,9 @@ class ShortStraddleBot:
         log.info("  REENTRY_WAIT  : %ds", cfg.reentry_wait)
         log.info("  SESSION       : %02d:%02d – %02d:%02d UTC",
                  *cfg.session_start, *cfg.session_end)
+        log.info("  DAILY_LOSS_LIM: $%.2f", cfg.daily_loss_limit)
+        log.info("  MANUAL_COOLDOWN: %ds", cfg.manual_close_cooldown)
+        log.info("  MAX_CONSEC_MC  : %d", cfg.max_consecutive_manual_closes)
         log.info("  Console level : INFO  |  File level: DEBUG")
         log.info("=" * 55)
 
@@ -1158,6 +1243,21 @@ class ShortStraddleBot:
                          trade.trade_id)
                 fills = {}
                 for leg in trade.legs:
+                    # ── BUG FIX: only buy back legs that the BOT still holds.
+                    # If leg.exited is True, the exchange position is already
+                    # gone (manually closed or reconciled away) — placing a
+                    # buy order here would open a NEW long position.
+                    if leg.exited and leg.actual_exit == 0.0:
+                        # Exited by reconciliation — no exchange position to
+                        # close; nothing to buy back.
+                        log.info("[Bot] Skipping exit buy for %s "
+                                 "(leg already closed externally)",
+                                 leg.symbol)
+                        continue
+                    if leg.exited:
+                        # Already handled (SL_HIT path set actual_exit via
+                        # exit_trade), no further action needed.
+                        continue
                     try:
                         _, fill = self._orders.live_buy(
                             leg.product_id, leg.symbol, cfg.quantity)
@@ -1173,6 +1273,16 @@ class ShortStraddleBot:
                     trade.call_leg.actual_exit = fills[trade.call_leg.symbol]
                 if fills.get(trade.put_leg.symbol):
                     trade.put_leg.actual_exit  = fills[trade.put_leg.symbol]
+
+                # ── Apply cooldown for manual closes too, not just SL_HIT ──
+                # This was the second bug: the bot re-entered immediately after
+                # a manual close because last_sl_time was only set in
+                # PositionManager.monitor_sl (SL_HIT path).  We always enforce
+                # the reentry wait here regardless of exit reason.
+                if self._state.last_sl_time is None or (
+                    _utcnow() - self._state.last_sl_time
+                ).total_seconds() > 1:
+                    self._state.last_sl_time = _utcnow()
 
                 # Recompute session realised PnL from all trades with full fills
                 c_e, c_x = trade.call_leg.actual_entry, trade.call_leg.actual_exit
@@ -1222,6 +1332,11 @@ class ShortStraddleBot:
                 log.debug("[Bot] Active trade still open — sleeping 30s")
                 time.sleep(30)
                 continue
+
+            if self._state.daily_loss_halt:
+                log.warning("[Bot] 🚨 Daily loss limit reached — "
+                            "halting for the rest of the session")
+                break
 
             if not self._strategy.can_reenter():
                 log.debug("[Bot] Re-entry blocked — sleeping 60s")
